@@ -14,6 +14,7 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/sirupsen/logrus"
 	"io"
+	"net"
 	"time"
 	"tuic-client/channel"
 	"tuic-client/config"
@@ -126,10 +127,18 @@ func (c *TUICClient) dial() error {
 
 func (c *TUICClient) heartbeat() {
 	for {
-		time.Sleep(time.Second)
+		time.Sleep(time.Second * 3)
 		cmd := protocol.Command{
 			Version: protocol.VersionMajor,
 			Type:    protocol.CmdHeartbeat,
+		}
+
+		if !c.isConnAlive() {
+			err := c.dial()
+			if err != nil {
+				logrus.Errorf("dial addr:%s failed: %v", c.Server, err)
+				continue
+			}
 		}
 
 		b, err := cmd.Marshal()
@@ -203,7 +212,12 @@ func (c *TUICClient) listenTcpConn() {
 			go func(packet *channel.Packet) {
 				defer channel.SetTcpComplete()
 				err := c.onHandleTcpConnect(packet)
-				if err != nil {
+				if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+					var streamErr *quic.StreamError
+					if errors.As(err, &streamErr) && streamErr.ErrorCode == quic.StreamErrorCode(0) {
+						return
+					}
+
 					logrus.Errorf("handle tcp connect failed: %v", err)
 				}
 			}(packet)
