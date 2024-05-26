@@ -90,12 +90,16 @@ func (c *TUICClient) dial() error {
 
 	//goland:noinspection SpellCheckingInspection
 	quicConfig := &quic.Config{
-		Versions:             []quic.Version{quic.Version2},
-		HandshakeIdleTimeout: 3 * time.Second,
-		MaxIdleTimeout:       10 * time.Second,
-		Allow0RTT:            cfg.ZeroRTTHandshake,
-		KeepAlivePeriod:      time.Second,
-		EnableDatagrams:      true,
+		Versions:                       []quic.Version{quic.Version2},
+		HandshakeIdleTimeout:           3 * time.Second,
+		MaxIdleTimeout:                 10 * time.Second,
+		Allow0RTT:                      cfg.ZeroRTTHandshake,
+		KeepAlivePeriod:                time.Second * 3,
+		EnableDatagrams:                true,
+		InitialStreamReceiveWindow:     8 * 1024 * 1024 * 2,
+		InitialConnectionReceiveWindow: 8 * 1024 * 1024 * 2,
+		MaxIncomingStreams:             protocol.DefaultConcurrentStreams,
+		MaxIncomingUniStreams:          protocol.DefaultConcurrentStreams,
 	}
 
 	var conn quic.Connection

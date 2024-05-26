@@ -3,6 +3,7 @@ package socket
 import (
 	"errors"
 	"github.com/ZYKJShadow/tuic-protocol-go/address"
+	"github.com/ZYKJShadow/tuic-protocol-go/protocol"
 	"github.com/sirupsen/logrus"
 	"github.com/txthinking/socks5"
 	"net"
@@ -60,7 +61,7 @@ func (s *SockServer) UDPHandle(server *socks5.Server, addr *net.UDPAddr, d *sock
 }
 
 func (s *SockServer) onHandleConnect(c *net.TCPConn, r *socks5.Request) error {
-	addr, err := net.ResolveTCPAddr("tcp", r.Address())
+	addr, err := net.ResolveTCPAddr(protocol.NetworkTcp, r.Address())
 	if err != nil {
 		logrus.Errorf("[socks5] handle connect failed, err: %v", err)
 		return err
@@ -70,14 +71,8 @@ func (s *SockServer) onHandleConnect(c *net.TCPConn, r *socks5.Request) error {
 		return errors.New("resolve tcp addr failed")
 	}
 
-	protocolAddr := s.getProtocolAddr(addr)
-	if protocolAddr.TypeCode() == address.AddrTypeNone {
-		logrus.Errorf("address type none")
-		return errors.New("resolve tcp addr failed")
-	}
-
 	channel.SetTcpChanPacket(&channel.Packet{
-		Addr: protocolAddr,
+		Addr: &address.SocketAddress{Addr: *addr},
 		Conn: c,
 	})
 
@@ -140,8 +135,11 @@ func (s *SockServer) getProtocolAddr(targetAddr net.Addr) address.Address {
 			Addr: net.TCPAddr{IP: addr.IP, Port: addr.Port},
 		}
 	case *net.TCPAddr:
-		return &address.DomainAddress{Domain: addr.IP.String(), Port: uint16(addr.Port)}
+		return &address.SocketAddress{
+			Addr: net.TCPAddr{
+				IP: addr.IP,
+			},
+		}
 	}
-
 	return &address.NoneAddress{}
 }
