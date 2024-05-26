@@ -26,6 +26,7 @@ type ClientConfig struct {
 	UDPRelayMode     string   `json:"udp_relay_mode"`
 	ALPN             []string `json:"alpn"`
 	ZeroRTTHandshake bool     `json:"zero_rtt_handshake"`
+	MaxStreamCount   int64    `json:"max_stream_count"`
 }
 
 func (c *Config) Unmarshal(b []byte) error {

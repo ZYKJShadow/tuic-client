@@ -98,8 +98,8 @@ func (c *TUICClient) dial() error {
 		EnableDatagrams:                true,
 		InitialStreamReceiveWindow:     8 * 1024 * 1024 * 2,
 		InitialConnectionReceiveWindow: 8 * 1024 * 1024 * 2,
-		MaxIncomingStreams:             protocol.DefaultConcurrentStreams,
-		MaxIncomingUniStreams:          protocol.DefaultConcurrentStreams,
+		MaxIncomingStreams:             cfg.MaxStreamCount,
+		MaxIncomingUniStreams:          cfg.MaxStreamCount,
 	}
 
 	var conn quic.Connection

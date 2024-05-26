@@ -16,7 +16,8 @@
       "h3"
     ],
     "cert_path": "",
-    "udp_relay_mode": ""
+    "udp_relay_mode": "",
+    "max_stream_count": 100
   },
   "socks_config": {
     "server": "127.0.0.1:7798",
@@ -36,6 +37,7 @@ client_config:
 5. alpn:协议列表
 6. cert_path: 证书路径
 7. udp_relay_mode（暂未实现）: udp转发模式，可填入native或quic
+8. max_stream_count: 最大流个数
 
 socks_config:
 1. server: socks5服务器地址

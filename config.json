@@ -8,7 +8,8 @@
       "h3"
     ],
     "cert_path": "",
-    "udp_relay_mode": ""
+    "udp_relay_mode": "",
+    "max_stream_count": 100
   },
   "socks_config": {
     "server": "127.0.0.1:7798",
