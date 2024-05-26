@@ -374,9 +374,9 @@ func (c *TUICClient) onHandleTcpConnect(packet *channel.Packet) error {
 		return err
 	}
 
-	defer func() {
-		_ = stream.Close()
-	}()
+	_ = stream.SetDeadline(time.Now().Add(time.Second * 10))
+
+	defer c.onCloseStream(stream)
 
 	cmd := protocol.Command{
 		Version: protocol.VersionMajor,
@@ -470,4 +470,9 @@ func (c *TUICClient) onHandlePacket(stream io.Reader) error {
 	}
 
 	return nil
+}
+
+func (c *TUICClient) onCloseStream(stream quic.Stream) {
+	stream.CancelWrite(quic.StreamErrorCode(0))
+	stream.CancelRead(quic.StreamErrorCode(0))
 }
