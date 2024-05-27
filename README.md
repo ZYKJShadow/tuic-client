@@ -45,7 +45,3 @@ socks_config:
 3. username: socks5用户名
 4. password: socks5密码
 5. max_packet_size: 最大包大小
-
-### 使用方式
-1、先部署好服务器，参阅[tuic-server](https://github.com/ZYKJShadow/tuic-server)<br>
-2、拉取代码，在主目录层级下执行go build，将.exe执行文件更名为tuic-client.exe，替换V2rayN的bin/tuic目录下的执行文件

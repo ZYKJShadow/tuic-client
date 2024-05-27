@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"github.com/sirupsen/logrus"
 	"os"
 	"tuic-client/client"
 	"tuic-client/config"
@@ -19,6 +20,7 @@ func init() {
 func main() {
 
 	flag.Parse()
+	logrus.SetReportCaller(true)
 
 	clientCfg := &config.ClientConfig{}
 	socksConfig := &config.SocksConfig{}

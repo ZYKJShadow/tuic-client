@@ -15,6 +15,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"io"
 	"net"
+	"sync"
 	"time"
 	"tuic-client/channel"
 	"tuic-client/config"
@@ -392,18 +393,54 @@ func (c *TUICClient) onHandleTcpConnect(packet *channel.Packet) error {
 
 	conn := packet.Conn
 
-	errCh := make(chan error, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+
 	go func() {
+		defer wg.Done()
+		// 从conn读取数据并写入stream
+		_, err := io.Copy(stream, packet.Conn)
+		if err != nil {
+			// 取消写入并通知服务器
+			switch {
+			case errors.Is(err, net.ErrClosed):
+				stream.CancelWrite(protocol.NormalClosed)
+			default:
+				logrus.Errorf("stream, packet.Conn err: %v", err)
+				stream.CancelWrite(protocol.ClientCanceled)
+			}
+			return
+		}
+
+		// 数据发送完毕，正常关闭写入端
+		_ = stream.Close()
+	}()
+
+	go func() {
+		defer wg.Done()
+		// 从stream读取数据并写入conn
 		_, err := io.Copy(conn, stream)
-		errCh <- err
+		if err != nil {
+			conn.Close()
+
+			var e *quic.StreamError
+			if errors.As(err, &e) && e.ErrorCode == protocol.NormalClosed {
+				return
+			}
+
+			switch {
+			case errors.Is(err, net.ErrClosed):
+				return
+			default:
+				logrus.Errorf("conn, stream err: %v", err)
+			}
+
+		}
 	}()
 
-	go func() {
-		_, err := io.Copy(stream, conn)
-		errCh <- err
-	}()
+	wg.Wait()
 
-	return <-errCh
+	return nil
 }
 
 func (c *TUICClient) sendCommand(stream quic.SendStream, cmd protocol.Command) error {
