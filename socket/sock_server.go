@@ -15,10 +15,11 @@ import (
 
 type SockServer struct {
 	*socks5.Server
-	NextAssocID atomic.Uint32
-	DualStack   bool
 	*config.SocksConfig
 	sync.Mutex
+
+	assocID atomic.Uint32
+	connID  atomic.Uint32
 }
 
 func NewSockServer(config *config.SocksConfig) (*SockServer, error) {
@@ -32,20 +33,21 @@ func NewSockServer(config *config.SocksConfig) (*SockServer, error) {
 }
 
 func (s *SockServer) Start() error {
+	logrus.Infof("[socks5] server started, listening on %s", s.Addr)
+
 	err := s.ListenAndServe(s)
 	if err != nil {
 		logrus.Errorf("[socks5] server start failed, err: %v", err)
 		return err
 	}
 
-	logrus.Infof("[socks5] server started, listening on %s", s.Addr)
 	return nil
 }
 
 func (s *SockServer) TCPHandle(server *socks5.Server, c *net.TCPConn, r *socks5.Request) error {
 	switch r.Cmd {
 	case socks5.CmdUDP:
-		return s.onHandleAssociate(server, c, r)
+		return s.onHandleAssociate(c, r)
 	case socks5.CmdConnect:
 		return s.onHandleConnect(c, r)
 	case socks5.CmdBind:
@@ -57,6 +59,24 @@ func (s *SockServer) TCPHandle(server *socks5.Server, c *net.TCPConn, r *socks5.
 }
 
 func (s *SockServer) UDPHandle(server *socks5.Server, addr *net.UDPAddr, d *socks5.Datagram) error {
+	logrus.Infof("[socks5] handle udp, addr: %s, data: %s target:%s", addr, d.Data, d.Address())
+
+	targetAddr, err := net.ResolveUDPAddr(protocol.NetworkUdp, d.Address())
+	if err != nil {
+		logrus.Errorf("[socks5] handle udp failed, err: %v", err)
+		return err
+	}
+
+	channel.SetUdpChanPacket(&channel.Packet{
+		RemoteAddr: &address.SocketAddress{Addr: net.TCPAddr{
+			IP:   targetAddr.IP,
+			Port: targetAddr.Port,
+		}},
+		UdpConn: server.UDPConn,
+		AssocID: uint16(s.assocID.Add(1)),
+		Data:    d.Data,
+	})
+
 	return nil
 }
 
@@ -71,75 +91,23 @@ func (s *SockServer) onHandleConnect(c *net.TCPConn, r *socks5.Request) error {
 		return errors.New("resolve tcp addr failed")
 	}
 
+	id := uint16(s.connID.Add(1))
 	channel.SetTcpChanPacket(&channel.Packet{
-		Addr: &address.SocketAddress{Addr: *addr},
-		Conn: c,
+		RemoteAddr: &address.SocketAddress{Addr: *addr},
+		TcpConn:    c,
+		ConnID:     id,
 	})
 
-	<-channel.ReadTcpComplete()
+	<-channel.ReadTcpComplete(id)
 
 	return nil
 }
 
-func (s *SockServer) onHandleAssociate(server *socks5.Server, c *net.TCPConn, r *socks5.Request) error {
-	id := s.NextAssocID.Add(1)
-
-	targetAddr, err := r.UDP(c, server.ServerAddr)
+func (s *SockServer) onHandleAssociate(c *net.TCPConn, r *socks5.Request) error {
+	_, err := r.UDP(c, s.ServerAddr)
 	if err != nil {
-		logrus.Errorf("[socks5] handle associate failed, err: %v", err)
 		return err
 	}
 
-	protocolAddr := s.getProtocolAddr(targetAddr)
-
-	go func() {
-
-		defer func() {
-			err := c.Close()
-			if err != nil {
-				logrus.Errorf("[socks5] handle associate failed, err: %v", err)
-				return
-			}
-		}()
-
-		var n int
-		for {
-			b := make([]byte, s.MaxPacketSize)
-			n, err = c.Read(b)
-			if err != nil {
-				logrus.Errorf("[socks5] handle associate failed, err: %v", err)
-				break
-			}
-
-			d, err := socks5.NewDatagramFromBytes(b[:n])
-			if err != nil {
-				logrus.Errorf("[socks5] handle associate failed, err: %v", err)
-				continue
-			}
-
-			channel.SetUdpChanPacket(&channel.Packet{
-				Addr:    protocolAddr,
-				Data:    d.Data,
-				AssocID: uint16(id),
-			})
-		}
-	}()
-
 	return nil
-}
-
-func (s *SockServer) getProtocolAddr(targetAddr net.Addr) address.Address {
-	switch addr := targetAddr.(type) {
-	case *net.UDPAddr:
-		return &address.SocketAddress{
-			Addr: net.TCPAddr{IP: addr.IP, Port: addr.Port},
-		}
-	case *net.TCPAddr:
-		return &address.SocketAddress{
-			Addr: net.TCPAddr{
-				IP: addr.IP,
-			},
-		}
-	}
-	return &address.NoneAddress{}
 }

@@ -3,40 +3,87 @@ package channel
 import (
 	"github.com/ZYKJShadow/tuic-protocol-go/address"
 	"net"
+	"sync"
 )
 
-var udpChannel = make(chan *Packet, 100)
-var tcpChannel = make(chan *Packet, 100)
-
-var tcpCompleteChannel = make(chan struct{}, 100)
-
 type Packet struct {
-	Addr    address.Address
-	AssocID uint16
-	Data    []byte
-	Conn    *net.TCPConn
+	RemoteAddr address.Address
+	AssocID    uint16
+	Data       []byte
+	TcpConn    *net.TCPConn
+	UdpConn    *net.UDPConn
+	ConnID     uint16
+}
+
+type channelManager struct {
+	udpChannel         chan *Packet
+	tcpChannel         chan *Packet
+	tcpCompleteChannel map[uint16]chan struct{}
+	udpCompleteChannel map[uint16]chan struct{}
+	mu                 sync.RWMutex
+}
+
+var manager = &channelManager{
+	udpChannel:         make(chan *Packet, 100),
+	tcpChannel:         make(chan *Packet, 100),
+	tcpCompleteChannel: make(map[uint16]chan struct{}, 100),
+	udpCompleteChannel: make(map[uint16]chan struct{}, 100),
 }
 
 func SetUdpChanPacket(n *Packet) {
-	udpChannel <- n
-}
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
 
-func ReadUdpChanPacket() <-chan *Packet {
-	return udpChannel
+	if _, ok := manager.udpCompleteChannel[n.AssocID]; !ok {
+		manager.udpCompleteChannel[n.AssocID] = make(chan struct{})
+	}
+
+	manager.udpChannel <- n
 }
 
 func SetTcpChanPacket(n *Packet) {
-	tcpChannel <- n
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+
+	if _, ok := manager.tcpCompleteChannel[n.ConnID]; !ok {
+		manager.tcpCompleteChannel[n.ConnID] = make(chan struct{})
+	}
+
+	manager.tcpChannel <- n
+}
+
+func ReadUdpChanPacket() <-chan *Packet {
+	return manager.udpChannel
 }
 
 func ReadTcpChanPacket() <-chan *Packet {
-	return tcpChannel
+	return manager.tcpChannel
 }
 
-func SetTcpComplete() {
-	tcpCompleteChannel <- struct{}{}
+func SetTcpComplete(connID uint16) {
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+
+	manager.tcpCompleteChannel[connID] <- struct{}{}
 }
 
-func ReadTcpComplete() <-chan struct{} {
-	return tcpCompleteChannel
+func ReadTcpComplete(connID uint16) <-chan struct{} {
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+
+	return manager.tcpCompleteChannel[connID]
+}
+
+func SetUdpComplete(assocID uint16) {
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+
+	manager.udpCompleteChannel[assocID] <- struct{}{}
+}
+
+func ReadUdpComplete(assocID uint16) <-chan struct{} {
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+
+	return manager.udpCompleteChannel[assocID]
 }

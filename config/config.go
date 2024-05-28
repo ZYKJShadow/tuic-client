@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"errors"
+	"github.com/ZYKJShadow/tuic-protocol-go/protocol"
 )
 
 type Config struct {
@@ -38,6 +39,7 @@ func (c *ClientConfig) SetDefaults() {
 	c.Server = "127.0.0.1:8888"
 	c.UUID = "0dcd8b80-603c-49dd-bfb7-61ebcfd5fbb8"
 	c.Password = "0dcd8b80-603c-49dd-bfb7-61ebcfd5fbb8"
+	c.UDPRelayMode = protocol.UdpRelayModeQuic
 	c.CertPath = ""
 	c.ZeroRTTHandshake = false
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"time"
 	"tuic-client/channel"
@@ -107,19 +108,20 @@ func (c *TUICClient) dial() error {
 	if cfg.ZeroRTTHandshake {
 		conn, err = quic.DialAddrEarly(c.ctx, cfg.Server, tlsConfig, quicConfig)
 		if err != nil {
-			logrus.Errorf("dial addr:%s failed: %v", cfg.Server, err)
-			conn, err = quic.DialAddr(c.ctx, cfg.Server, tlsConfig, quicConfig)
+			logrus.Errorf("dial addr:%s early failed: %v", cfg.Server, err)
 		}
-	} else {
-		conn, err = quic.DialAddr(c.ctx, cfg.Server, tlsConfig, quicConfig)
 	}
 
-	if err != nil {
-		logrus.Errorf("dial addr:%s failed: %v", cfg.Server, err)
-		return err
+	if conn == nil {
+		conn, err = quic.DialAddr(c.ctx, cfg.Server, tlsConfig, quicConfig)
+		if err != nil {
+			logrus.Errorf("dial addr:%s failed: %v", cfg.Server, err)
+			return err
+		}
 	}
 
 	logrus.Infof("dial addr:%s success", cfg.Server)
+
 	c.conn = conn
 
 	err = c.authenticate()
@@ -190,7 +192,7 @@ func (c *TUICClient) authenticate() error {
 		},
 	}
 
-	err = c.sendCommand(stream, cmd)
+	err = c.onSendCommand(stream, cmd)
 	if err != nil {
 		return err
 	}
@@ -215,7 +217,7 @@ func (c *TUICClient) listenTcpConn() {
 			}
 
 			go func(packet *channel.Packet) {
-				defer channel.SetTcpComplete()
+				defer channel.SetTcpComplete(packet.ConnID)
 				err := c.onHandleTcpConnect(packet)
 				if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
 					var streamErr *quic.StreamError
@@ -256,28 +258,59 @@ func (c *TUICClient) listenUdpConn() {
 				}
 			}
 
-			opts := &options.PacketOptions{
-				AssocID:   packet.AssocID,
-				FragTotal: 1,
-				FragID:    0,
-				Size:      0,
-				Addr:      packet.Addr,
-			}
+			go func(packet *channel.Packet) {
+				defer channel.SetUdpComplete(packet.AssocID)
 
-			opts.CalFragTotal(packet.Data, 2048)
-			if opts.FragTotal > 1 {
-				// 分片发送
-				fragSize := len(packet.Data) / int(opts.FragTotal)
-				for i := 0; i < int(opts.FragTotal); i++ {
-					opts.FragID = uint8(i)
-					start := i * fragSize
-					end := start + fragSize
-					if i == int(opts.FragTotal)-1 {
-						end = len(packet.Data)
+				opts := &options.PacketOptions{
+					AssocID:   packet.AssocID,
+					FragTotal: 1,
+					FragID:    0,
+					Size:      0,
+					Addr:      packet.RemoteAddr,
+				}
+
+				opts.CalFragTotal(packet.Data, 2048)
+				if opts.FragTotal > 1 {
+					// 分片发送
+					fragSize := len(packet.Data) / int(opts.FragTotal)
+					for i := 0; i < int(opts.FragTotal); i++ {
+						opts.FragID = uint8(i)
+						start := i * fragSize
+						end := start + fragSize
+						if i == int(opts.FragTotal)-1 {
+							end = len(packet.Data)
+						}
+						opts.Size = uint16(end - start)
+
+						fragData := packet.Data[start:end]
+						cmd := protocol.Command{
+							Version: protocol.VersionMajor,
+							Type:    protocol.CmdPacket,
+							Options: opts,
+						}
+
+						cmdBytes, err := cmd.Marshal()
+						if err != nil {
+							logrus.Errorf("marshal packet failed: %v", err)
+							continue
+						}
+
+						cmdBytes = append(cmdBytes, fragData...)
+
+						switch c.UDPRelayMode {
+						case protocol.UdpRelayModeQuic:
+							err = c.sendFragments(cmdBytes)
+						case protocol.UdpRelayModeNative:
+							err = c.conn.SendDatagram(cmdBytes)
+						}
+
+						if err != nil {
+							logrus.Errorf("send fragment failed: %v", err)
+							continue
+						}
 					}
-					opts.Size = uint16(end - start)
-
-					fragData := packet.Data[start:end]
+				} else {
+					opts.Size = uint16(len(packet.Data))
 					cmd := protocol.Command{
 						Version: protocol.VersionMajor,
 						Type:    protocol.CmdPacket,
@@ -287,51 +320,27 @@ func (c *TUICClient) listenUdpConn() {
 					cmdBytes, err := cmd.Marshal()
 					if err != nil {
 						logrus.Errorf("marshal packet failed: %v", err)
-						continue
+						return
 					}
 
-					cmdBytes = append(cmdBytes, fragData...)
+					cmdBytes = append(cmdBytes, packet.Data...)
 
 					switch c.UDPRelayMode {
 					case protocol.UdpRelayModeQuic:
 						err = c.sendFragments(cmdBytes)
 					case protocol.UdpRelayModeNative:
 						err = c.conn.SendDatagram(cmdBytes)
+					default:
+						logrus.Errorf("udp relay mode:%s not support", c.UDPRelayMode)
+						return
 					}
 
 					if err != nil {
-						logrus.Errorf("send fragment failed: %v", err)
-						continue
+						logrus.Errorf("send data failed: %v", err)
+						return
 					}
 				}
-			} else {
-				opts.Size = uint16(len(packet.Data))
-				cmd := protocol.Command{
-					Version: protocol.VersionMajor,
-					Type:    protocol.CmdPacket,
-					Options: opts,
-				}
-
-				cmdBytes, err := cmd.Marshal()
-				if err != nil {
-					logrus.Errorf("marshal packet failed: %v", err)
-					continue
-				}
-
-				cmdBytes = append(cmdBytes, packet.Data...)
-
-				switch c.UDPRelayMode {
-				case protocol.UdpRelayModeQuic:
-					err = c.sendFragments(cmdBytes)
-				case protocol.UdpRelayModeNative:
-					err = c.conn.SendDatagram(cmdBytes)
-				}
-
-				if err != nil {
-					logrus.Errorf("send data failed: %v", err)
-					continue
-				}
-			}
+			}(packet)
 		}
 	}
 }
@@ -342,12 +351,9 @@ func (c *TUICClient) sendFragments(data []byte) error {
 		return fmt.Errorf("open stream failed: %v", err)
 	}
 
-	defer func(stream quic.SendStream) {
-		err = stream.Close()
-		if err != nil {
-			logrus.Errorf("close stream failed: %v", err)
-		}
-	}(stream)
+	defer func() {
+		_ = stream.Close()
+	}()
 
 	_, err = io.Copy(stream, bytes.NewReader(data))
 	if err != nil {
@@ -359,11 +365,11 @@ func (c *TUICClient) sendFragments(data []byte) error {
 
 func (c *TUICClient) onHandleTcpConnect(packet *channel.Packet) error {
 	defer func() {
-		_ = packet.Conn.Close()
+		_ = packet.TcpConn.Close()
 	}()
 
 	opts := &options.ConnectOptions{
-		Addr: packet.Addr,
+		Addr: packet.RemoteAddr,
 	}
 
 	ctx, cancel := context.WithDeadline(c.ctx, time.Now().Add(time.Second*3))
@@ -385,13 +391,13 @@ func (c *TUICClient) onHandleTcpConnect(packet *channel.Packet) error {
 		Options: opts,
 	}
 
-	err = c.sendCommand(stream, cmd)
+	err = c.onSendCommand(stream, cmd)
 	if err != nil {
 		logrus.Errorf("send command failed: %v", err)
 		return err
 	}
 
-	conn := packet.Conn
+	conn := packet.TcpConn
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -399,16 +405,24 @@ func (c *TUICClient) onHandleTcpConnect(packet *channel.Packet) error {
 	go func() {
 		defer wg.Done()
 		// 从conn读取数据并写入stream
-		_, err := io.Copy(stream, packet.Conn)
+		_, err := io.Copy(stream, packet.TcpConn)
 		if err != nil {
 			// 取消写入并通知服务器
 			switch {
 			case errors.Is(err, net.ErrClosed):
 				stream.CancelWrite(protocol.NormalClosed)
 			default:
-				logrus.Errorf("stream, packet.Conn err: %v", err)
 				stream.CancelWrite(protocol.ClientCanceled)
+
+				var e *quic.StreamError
+				if errors.As(err, &e) && e.ErrorCode == protocol.NormalClosed {
+					return
+				}
+
+				logrus.Errorf("stream, packet.TcpConn err: %v", err)
+
 			}
+
 			return
 		}
 
@@ -431,6 +445,8 @@ func (c *TUICClient) onHandleTcpConnect(packet *channel.Packet) error {
 			switch {
 			case errors.Is(err, net.ErrClosed):
 				return
+			case strings.Contains(err.Error(), "deadline exceeded"):
+				return
 			default:
 				logrus.Errorf("conn, stream err: %v", err)
 			}
@@ -439,22 +455,6 @@ func (c *TUICClient) onHandleTcpConnect(packet *channel.Packet) error {
 	}()
 
 	wg.Wait()
-
-	return nil
-}
-
-func (c *TUICClient) sendCommand(stream quic.SendStream, cmd protocol.Command) error {
-	// 发送Command
-	b, err := cmd.Marshal()
-	if err != nil {
-		return err
-	}
-
-	// 发送Command数据
-	_, err = stream.Write(b)
-	if err != nil {
-		return err
-	}
 
 	return nil
 }
@@ -512,4 +512,20 @@ func (c *TUICClient) onHandlePacket(stream io.Reader) error {
 func (c *TUICClient) onCloseStream(stream quic.Stream) {
 	stream.CancelWrite(quic.StreamErrorCode(0))
 	stream.CancelRead(quic.StreamErrorCode(0))
+}
+
+func (c *TUICClient) onSendCommand(stream quic.SendStream, cmd protocol.Command) error {
+	// 发送Command
+	b, err := cmd.Marshal()
+	if err != nil {
+		return err
+	}
+
+	// 发送Command数据
+	_, err = stream.Write(b)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
