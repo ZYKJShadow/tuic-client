@@ -7,29 +7,27 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/txthinking/socks5"
 	"net"
-	"sync"
 	"sync/atomic"
-	"tuic-client/channel"
+	"tuic-client/client"
 	"tuic-client/config"
 )
 
 type SockServer struct {
 	*socks5.Server
 	*config.SocksConfig
-	sync.Mutex
+	*client.TUICClient
 
 	assocID atomic.Uint32
-	connID  atomic.Uint32
 }
 
-func NewSockServer(config *config.SocksConfig) (*SockServer, error) {
+func NewSockServer(config *config.SocksConfig, c *client.TUICClient) (*SockServer, error) {
 	server, err := socks5.NewClassicServer(config.Server, config.Ip, config.Username, config.Password, 10, 10)
 	if err != nil {
 		logrus.Errorf("[socks5] create server failed, err: %v", err)
 		return nil, err
 	}
 
-	return &SockServer{Server: server, SocksConfig: config}, nil
+	return &SockServer{Server: server, SocksConfig: config, TUICClient: c}, nil
 }
 
 func (s *SockServer) Start() error {
@@ -44,7 +42,7 @@ func (s *SockServer) Start() error {
 	return nil
 }
 
-func (s *SockServer) TCPHandle(server *socks5.Server, c *net.TCPConn, r *socks5.Request) error {
+func (s *SockServer) TCPHandle(_ *socks5.Server, c *net.TCPConn, r *socks5.Request) error {
 	switch r.Cmd {
 	case socks5.CmdUDP:
 		return s.onHandleAssociate(c, r)
@@ -58,7 +56,7 @@ func (s *SockServer) TCPHandle(server *socks5.Server, c *net.TCPConn, r *socks5.
 	return nil
 }
 
-func (s *SockServer) UDPHandle(server *socks5.Server, addr *net.UDPAddr, d *socks5.Datagram) error {
+func (s *SockServer) UDPHandle(_ *socks5.Server, addr *net.UDPAddr, d *socks5.Datagram) error {
 	logrus.Infof("[socks5] handle udp, addr: %s, data: %s target:%s", addr, d.Data, d.Address())
 
 	targetAddr, err := net.ResolveUDPAddr(protocol.NetworkUdp, d.Address())
@@ -67,15 +65,10 @@ func (s *SockServer) UDPHandle(server *socks5.Server, addr *net.UDPAddr, d *sock
 		return err
 	}
 
-	channel.SetUdpChanPacket(&channel.Packet{
-		RemoteAddr: &address.SocketAddress{Addr: net.TCPAddr{
-			IP:   targetAddr.IP,
-			Port: targetAddr.Port,
-		}},
-		UdpConn: server.UDPConn,
-		AssocID: uint16(s.assocID.Add(1)),
-		Data:    d.Data,
-	})
+	s.TUICClient.OnHandleUdpConnect(uint16(s.assocID.Add(1)), d.Data, &address.SocketAddress{Addr: net.TCPAddr{
+		IP:   targetAddr.IP,
+		Port: targetAddr.Port,
+	}})
 
 	return nil
 }
@@ -91,14 +84,10 @@ func (s *SockServer) onHandleConnect(c *net.TCPConn, r *socks5.Request) error {
 		return errors.New("resolve tcp addr failed")
 	}
 
-	id := uint16(s.connID.Add(1))
-	channel.SetTcpChanPacket(&channel.Packet{
-		RemoteAddr: &address.SocketAddress{Addr: *addr},
-		TcpConn:    c,
-		ConnID:     id,
-	})
-
-	<-channel.ReadTcpComplete(id)
+	err = s.TUICClient.OnHandleTcpConnect(c, &address.SocketAddress{Addr: *addr})
+	if err != nil {
+		return err
+	}
 
 	return nil
 }

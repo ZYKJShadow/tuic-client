@@ -18,7 +18,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"tuic-client/channel"
 	"tuic-client/config"
 )
 
@@ -42,8 +41,6 @@ func (c *TUICClient) Start() error {
 	}
 
 	go c.heartbeat()
-	go c.listenUdpConn()
-	go c.listenTcpConn()
 
 	return nil
 }
@@ -200,38 +197,6 @@ func (c *TUICClient) authenticate() error {
 	return nil
 }
 
-func (c *TUICClient) listenTcpConn() {
-	for {
-		select {
-		case packet, ok := <-channel.ReadTcpChanPacket():
-			if !ok {
-				return
-			}
-
-			if !c.isConnAlive() {
-				err := c.dial()
-				if err != nil {
-					logrus.Errorf("dial failed: %v", err)
-					continue
-				}
-			}
-
-			go func(packet *channel.Packet) {
-				defer channel.SetTcpComplete(packet.ConnID)
-				err := c.onHandleTcpConnect(packet)
-				if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
-					var streamErr *quic.StreamError
-					if errors.As(err, &streamErr) && streamErr.ErrorCode == quic.StreamErrorCode(0) {
-						return
-					}
-
-					logrus.Errorf("handle tcp connect failed: %v", err)
-				}
-			}(packet)
-		}
-	}
-}
-
 func (c *TUICClient) isConnAlive() bool {
 	select {
 	case <-c.conn.Context().Done():
@@ -241,108 +206,87 @@ func (c *TUICClient) isConnAlive() bool {
 	}
 }
 
-func (c *TUICClient) listenUdpConn() {
-	for {
-		select {
-		case packet, ok := <-channel.ReadUdpChanPacket():
-			if !ok {
-				logrus.Infof("channel closed")
-				return
+func (c *TUICClient) OnHandleUdpConnect(assocID uint16, data []byte, remoteAddr address.Address) {
+	opts := &options.PacketOptions{
+		AssocID:   assocID,
+		FragTotal: 1,
+		FragID:    0,
+		Size:      0,
+		Addr:      remoteAddr,
+	}
+
+	opts.CalFragTotal(data, 2048)
+	if opts.FragTotal > 1 {
+		// 分片发送
+		fragSize := len(data) / int(opts.FragTotal)
+		for i := 0; i < int(opts.FragTotal); i++ {
+			opts.FragID = uint8(i)
+			start := i * fragSize
+			end := start + fragSize
+			if i == int(opts.FragTotal)-1 {
+				end = len(data)
+			}
+			opts.Size = uint16(end - start)
+
+			fragData := data[start:end]
+			cmd := protocol.Command{
+				Version: protocol.VersionMajor,
+				Type:    protocol.CmdPacket,
+				Options: opts,
 			}
 
-			if !c.isConnAlive() {
-				err := c.dial()
-				if err != nil {
-					logrus.Errorf("dial failed: %v", err)
-					continue
-				}
+			cmdBytes, err := cmd.Marshal()
+			if err != nil {
+				logrus.Errorf("marshal packet failed: %v", err)
+				continue
 			}
 
-			go func(packet *channel.Packet) {
-				defer channel.SetUdpComplete(packet.AssocID)
+			cmdBytes = append(cmdBytes, fragData...)
 
-				opts := &options.PacketOptions{
-					AssocID:   packet.AssocID,
-					FragTotal: 1,
-					FragID:    0,
-					Size:      0,
-					Addr:      packet.RemoteAddr,
-				}
+			switch c.UDPRelayMode {
+			case protocol.UdpRelayModeQuic:
+				err = c.sendFragments(cmdBytes)
+			case protocol.UdpRelayModeNative:
+				err = c.conn.SendDatagram(cmdBytes)
+			}
 
-				opts.CalFragTotal(packet.Data, 2048)
-				if opts.FragTotal > 1 {
-					// 分片发送
-					fragSize := len(packet.Data) / int(opts.FragTotal)
-					for i := 0; i < int(opts.FragTotal); i++ {
-						opts.FragID = uint8(i)
-						start := i * fragSize
-						end := start + fragSize
-						if i == int(opts.FragTotal)-1 {
-							end = len(packet.Data)
-						}
-						opts.Size = uint16(end - start)
+			if err != nil {
+				logrus.Errorf("send fragment failed: %v", err)
+				continue
+			}
+		}
+	} else {
+		opts.Size = uint16(len(data))
+		cmd := protocol.Command{
+			Version: protocol.VersionMajor,
+			Type:    protocol.CmdPacket,
+			Options: opts,
+		}
 
-						fragData := packet.Data[start:end]
-						cmd := protocol.Command{
-							Version: protocol.VersionMajor,
-							Type:    protocol.CmdPacket,
-							Options: opts,
-						}
+		cmdBytes, err := cmd.Marshal()
+		if err != nil {
+			logrus.Errorf("marshal packet failed: %v", err)
+			return
+		}
 
-						cmdBytes, err := cmd.Marshal()
-						if err != nil {
-							logrus.Errorf("marshal packet failed: %v", err)
-							continue
-						}
+		cmdBytes = append(cmdBytes, data...)
 
-						cmdBytes = append(cmdBytes, fragData...)
+		switch c.UDPRelayMode {
+		case protocol.UdpRelayModeQuic:
+			err = c.sendFragments(cmdBytes)
+		case protocol.UdpRelayModeNative:
+			err = c.conn.SendDatagram(cmdBytes)
+		default:
+			logrus.Errorf("udp relay mode:%s not support", c.UDPRelayMode)
+			return
+		}
 
-						switch c.UDPRelayMode {
-						case protocol.UdpRelayModeQuic:
-							err = c.sendFragments(cmdBytes)
-						case protocol.UdpRelayModeNative:
-							err = c.conn.SendDatagram(cmdBytes)
-						}
-
-						if err != nil {
-							logrus.Errorf("send fragment failed: %v", err)
-							continue
-						}
-					}
-				} else {
-					opts.Size = uint16(len(packet.Data))
-					cmd := protocol.Command{
-						Version: protocol.VersionMajor,
-						Type:    protocol.CmdPacket,
-						Options: opts,
-					}
-
-					cmdBytes, err := cmd.Marshal()
-					if err != nil {
-						logrus.Errorf("marshal packet failed: %v", err)
-						return
-					}
-
-					cmdBytes = append(cmdBytes, packet.Data...)
-
-					switch c.UDPRelayMode {
-					case protocol.UdpRelayModeQuic:
-						err = c.sendFragments(cmdBytes)
-					case protocol.UdpRelayModeNative:
-						err = c.conn.SendDatagram(cmdBytes)
-					default:
-						logrus.Errorf("udp relay mode:%s not support", c.UDPRelayMode)
-						return
-					}
-
-					if err != nil {
-						logrus.Errorf("send data failed: %v", err)
-						return
-					}
-				}
-			}(packet)
+		if err != nil {
+			logrus.Errorf("send data failed: %v", err)
+			return
 		}
 	}
+
 }
 
 func (c *TUICClient) sendFragments(data []byte) error {
@@ -363,13 +307,9 @@ func (c *TUICClient) sendFragments(data []byte) error {
 	return nil
 }
 
-func (c *TUICClient) onHandleTcpConnect(packet *channel.Packet) error {
-	defer func() {
-		_ = packet.TcpConn.Close()
-	}()
-
+func (c *TUICClient) OnHandleTcpConnect(conn *net.TCPConn, remoteAddr address.Address) error {
 	opts := &options.ConnectOptions{
-		Addr: packet.RemoteAddr,
+		Addr: remoteAddr,
 	}
 
 	ctx, cancel := context.WithDeadline(c.ctx, time.Now().Add(time.Second*3))
@@ -396,16 +336,13 @@ func (c *TUICClient) onHandleTcpConnect(packet *channel.Packet) error {
 		logrus.Errorf("send command failed: %v", err)
 		return err
 	}
-
-	conn := packet.TcpConn
-
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
 		// 从conn读取数据并写入stream
-		_, err := io.Copy(stream, packet.TcpConn)
+		_, err := io.Copy(stream, conn)
 		if err != nil {
 			// 取消写入并通知服务器
 			switch {
@@ -435,7 +372,7 @@ func (c *TUICClient) onHandleTcpConnect(packet *channel.Packet) error {
 		// 从stream读取数据并写入conn
 		_, err := io.Copy(conn, stream)
 		if err != nil {
-			conn.Close()
+			_ = conn.Close()
 
 			var e *quic.StreamError
 			if errors.As(err, &e) && e.ErrorCode == protocol.NormalClosed {

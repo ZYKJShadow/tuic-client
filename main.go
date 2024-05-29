@@ -55,7 +55,7 @@ func main() {
 		panic(err)
 	}
 
-	server, err := socket.NewSockServer(socksConfig)
+	server, err := socket.NewSockServer(socksConfig, c)
 	if err != nil {
 		panic(err)
 	}
