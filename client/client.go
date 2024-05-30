@@ -1,7 +1,6 @@
 package client
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -24,6 +23,7 @@ import (
 type TUICClient struct {
 	ctx  context.Context
 	conn quic.Connection
+	udp  *net.UDPConn
 	*config.ClientConfig
 }
 
@@ -206,7 +206,11 @@ func (c *TUICClient) isConnAlive() bool {
 	}
 }
 
-func (c *TUICClient) OnHandleUdpConnect(assocID uint16, data []byte, remoteAddr address.Address) {
+func (c *TUICClient) OnHandleUdpConnect(udp *net.UDPConn, assocID uint16, data []byte, remoteAddr address.Address) {
+	if c.udp == nil {
+		c.udp = udp
+	}
+
 	opts := &options.PacketOptions{
 		AssocID:   assocID,
 		FragTotal: 1,
@@ -216,95 +220,12 @@ func (c *TUICClient) OnHandleUdpConnect(assocID uint16, data []byte, remoteAddr 
 	}
 
 	opts.CalFragTotal(data, 2048)
-	if opts.FragTotal > 1 {
-		// 分片发送
-		fragSize := len(data) / int(opts.FragTotal)
-		for i := 0; i < int(opts.FragTotal); i++ {
-			opts.FragID = uint8(i)
-			start := i * fragSize
-			end := start + fragSize
-			if i == int(opts.FragTotal)-1 {
-				end = len(data)
-			}
-			opts.Size = uint16(end - start)
-
-			fragData := data[start:end]
-			cmd := protocol.Command{
-				Version: protocol.VersionMajor,
-				Type:    protocol.CmdPacket,
-				Options: opts,
-			}
-
-			cmdBytes, err := cmd.Marshal()
-			if err != nil {
-				logrus.Errorf("marshal packet failed: %v", err)
-				continue
-			}
-
-			cmdBytes = append(cmdBytes, fragData...)
-
-			switch c.UDPRelayMode {
-			case protocol.UdpRelayModeQuic:
-				err = c.sendFragments(cmdBytes)
-			case protocol.UdpRelayModeNative:
-				err = c.conn.SendDatagram(cmdBytes)
-			}
-
-			if err != nil {
-				logrus.Errorf("send fragment failed: %v", err)
-				continue
-			}
-		}
-	} else {
-		opts.Size = uint16(len(data))
-		cmd := protocol.Command{
-			Version: protocol.VersionMajor,
-			Type:    protocol.CmdPacket,
-			Options: opts,
-		}
-
-		cmdBytes, err := cmd.Marshal()
-		if err != nil {
-			logrus.Errorf("marshal packet failed: %v", err)
-			return
-		}
-
-		cmdBytes = append(cmdBytes, data...)
-
-		switch c.UDPRelayMode {
-		case protocol.UdpRelayModeQuic:
-			err = c.sendFragments(cmdBytes)
-		case protocol.UdpRelayModeNative:
-			err = c.conn.SendDatagram(cmdBytes)
-		default:
-			logrus.Errorf("udp relay mode:%s not support", c.UDPRelayMode)
-			return
-		}
-
-		if err != nil {
-			logrus.Errorf("send data failed: %v", err)
-			return
-		}
+	switch {
+	case opts.FragTotal > 1:
+		c.onRelayFragmentedUdpSend(data, opts)
+	default:
+		c.onRelayUdpSend(data, opts)
 	}
-
-}
-
-func (c *TUICClient) sendFragments(data []byte) error {
-	stream, err := c.conn.OpenUniStream()
-	if err != nil {
-		return fmt.Errorf("open stream failed: %v", err)
-	}
-
-	defer func() {
-		_ = stream.Close()
-	}()
-
-	_, err = io.Copy(stream, bytes.NewReader(data))
-	if err != nil {
-		return fmt.Errorf("write stream failed: %v", err)
-	}
-
-	return nil
 }
 
 func (c *TUICClient) OnHandleTcpConnect(conn *net.TCPConn, remoteAddr address.Address) error {
@@ -462,6 +383,69 @@ func (c *TUICClient) onSendCommand(stream quic.SendStream, cmd protocol.Command)
 	_, err = stream.Write(b)
 	if err != nil {
 		return err
+	}
+
+	return nil
+}
+
+func (c *TUICClient) onRelayFragmentedUdpSend(data []byte, opts *options.PacketOptions) {
+	fragSize := len(data) / int(opts.FragTotal)
+	for i := 0; i < int(opts.FragTotal); i++ {
+		opts.FragID = uint8(i)
+		start := i * fragSize
+		end := start + fragSize
+		if i == int(opts.FragTotal)-1 {
+			end = len(data)
+		}
+		fragment := data[start:end]
+		c.onRelayUdpSend(fragment, opts)
+	}
+}
+
+func (c *TUICClient) onRelayUdpSend(fragment []byte, opts *options.PacketOptions) {
+	opts.Size = uint16(len(fragment))
+	cmd := protocol.Command{
+		Version: protocol.VersionMajor,
+		Type:    protocol.CmdPacket,
+		Options: opts,
+	}
+
+	cmdBytes, err := cmd.Marshal()
+	if err != nil {
+		logrus.Errorf("marshal packet failed: %v", err)
+		return
+	}
+
+	cmdBytes = append(cmdBytes, fragment...)
+
+	switch c.UDPRelayMode {
+	case protocol.UdpRelayModeQuic:
+		err = c.sendFragments(cmdBytes)
+	case protocol.UdpRelayModeNative:
+		err = c.conn.SendDatagram(cmdBytes)
+	default:
+		logrus.Errorf("UDP relay mode %s not supported", c.UDPRelayMode)
+		return
+	}
+
+	if err != nil {
+		logrus.Errorf("send data failed: %v", err)
+	}
+}
+
+func (c *TUICClient) sendFragments(data []byte) error {
+	stream, err := c.conn.OpenUniStream()
+	if err != nil {
+		return fmt.Errorf("open stream failed: %v", err)
+	}
+
+	defer func() {
+		_ = stream.Close()
+	}()
+
+	_, err = stream.Write(data)
+	if err != nil {
+		return fmt.Errorf("write data failed: %v", err)
 	}
 
 	return nil

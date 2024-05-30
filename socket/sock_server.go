@@ -65,7 +65,7 @@ func (s *SockServer) UDPHandle(_ *socks5.Server, addr *net.UDPAddr, d *socks5.Da
 		return err
 	}
 
-	s.TUICClient.OnHandleUdpConnect(uint16(s.assocID.Add(1)), d.Data, &address.SocketAddress{Addr: net.TCPAddr{
+	s.TUICClient.OnHandleUdpConnect(s.UDPConn, uint16(s.assocID.Add(1)), d.Data, &address.SocketAddress{Addr: net.TCPAddr{
 		IP:   targetAddr.IP,
 		Port: targetAddr.Port,
 	}})
