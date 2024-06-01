@@ -1,12 +1,13 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"github.com/ZYKJShadow/tuic-protocol-go/address"
+	"github.com/ZYKJShadow/tuic-protocol-go/fragment"
 	"github.com/ZYKJShadow/tuic-protocol-go/options"
 	"github.com/ZYKJShadow/tuic-protocol-go/protocol"
 	"github.com/ZYKJShadow/tuic-protocol-go/utils"
@@ -14,23 +15,27 @@ import (
 	"github.com/sirupsen/logrus"
 	"io"
 	"net"
-	"strings"
 	"sync"
 	"time"
 	"tuic-client/config"
 )
 
 type TUICClient struct {
-	ctx  context.Context
-	conn quic.Connection
-	udp  *net.UDPConn
+	ctx            context.Context
+	conn           quic.Connection
+	fragmentCache  *fragment.FCache
+	socketCacheMap map[uint16]*net.UDPConn
+
 	*config.ClientConfig
+	sync.RWMutex
 }
 
 func NewTUICClient(ctx context.Context, cfg *config.ClientConfig) (*TUICClient, error) {
 	return &TUICClient{
-		ClientConfig: cfg,
-		ctx:          ctx,
+		ClientConfig:   cfg,
+		ctx:            ctx,
+		fragmentCache:  fragment.NewFCache(),
+		socketCacheMap: make(map[uint16]*net.UDPConn),
 	}, nil
 }
 
@@ -41,6 +46,8 @@ func (c *TUICClient) Start() error {
 	}
 
 	go c.heartbeat()
+	go c.onReceiveUniStream()
+	go c.onReceiveDatagram()
 
 	return nil
 }
@@ -166,12 +173,9 @@ func (c *TUICClient) authenticate() error {
 		return err
 	}
 
-	defer func(stream quic.SendStream) {
-		err = stream.Close()
-		if err != nil {
-			logrus.Errorf("close stream failed: %v", err)
-		}
-	}(stream)
+	defer func() {
+		_ = stream.Close()
+	}()
 
 	tlsConn := c.conn.ConnectionState().TLS
 	token, err := tlsConn.ExportKeyingMaterial(c.UUID[:16], []byte(c.Password), 32)
@@ -197,6 +201,124 @@ func (c *TUICClient) authenticate() error {
 	return nil
 }
 
+func (c *TUICClient) packet(stream io.Reader, opts *options.PacketOptions, mode string) error {
+	data := make([]byte, opts.Size)
+	_, err := io.ReadFull(stream, data)
+	if err != nil {
+		logrus.Errorf("Failed to read packet: %v", err)
+		return err
+	}
+
+	switch mode {
+	case protocol.UdpRelayModeQuic:
+		return c.onHandleQUICPacket(data, opts)
+	case protocol.UdpRelayModeNative:
+		return c.onHandlePacket(data, opts)
+	default:
+		return errors.New("unknown udp relay mode")
+	}
+}
+
+func (c *TUICClient) onReceiveUniStream() {
+	for {
+		stream, err := c.conn.AcceptUniStream(context.Background())
+		if err != nil {
+			logrus.Errorf("Failed to accept uni stream: %v", err)
+			continue
+		}
+
+		go c.onHandleUniStream(stream)
+	}
+}
+
+func (c *TUICClient) onReceiveDatagram() {
+	for {
+		datagram, err := c.conn.ReceiveDatagram(context.Background())
+		if err != nil {
+			logrus.Errorf("Failed to receive datagram: %v", err)
+			continue
+		}
+
+		go c.onHandleDatagram(datagram)
+	}
+}
+
+func (c *TUICClient) onHandleDatagram(datagram []byte) {
+	reader := bytes.NewReader(datagram)
+	var cmd protocol.Command
+	err := cmd.Unmarshal(reader)
+	if err != nil {
+		logrus.Errorf("Failed to read command: %v", err)
+		return
+	}
+
+	switch cmd.Type {
+	case protocol.CmdPacket:
+		err = c.packet(reader, cmd.Options.(*options.PacketOptions), protocol.UdpRelayModeNative)
+	default:
+		err = fmt.Errorf("unsupport command type: %d", cmd.Type)
+	}
+
+	if err != nil {
+		logrus.Errorf("onHandleDatagram err: %v", err)
+	}
+}
+
+func (c *TUICClient) onHandleUniStream(stream quic.ReceiveStream) {
+	var cmd protocol.Command
+	err := cmd.Unmarshal(stream)
+	if err != nil {
+		logrus.Errorf("Failed to read command: %v", err)
+		return
+	}
+
+	switch cmd.Type {
+	case protocol.CmdPacket:
+		err = c.packet(stream, cmd.Options.(*options.PacketOptions), protocol.UdpRelayModeQuic)
+	default:
+		err = fmt.Errorf("unsupport command type: %d", cmd.Type)
+	}
+
+	if err != nil {
+		logrus.Errorf("onHandleDatagram err: %v", err)
+	}
+}
+
+func (c *TUICClient) onHandleQUICPacket(data []byte, opts *options.PacketOptions) error {
+	if opts.FragTotal > 1 {
+		data = c.fragmentCache.AddFragment(opts.AssocID, opts.FragID, opts.FragTotal, opts.Size, data)
+	}
+
+	if data == nil {
+		return nil
+	}
+
+	err := c.onHandlePacket(data, opts)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *TUICClient) onHandlePacket(data []byte, opts *options.PacketOptions) error {
+	c.Lock()
+	defer c.Unlock()
+
+	conn := c.socketCacheMap[opts.AssocID]
+	if conn == nil {
+		return fmt.Errorf("conn not found, assocID: %d", opts.AssocID)
+	}
+
+	_, err := conn.Write(data)
+	if err != nil {
+		logrus.Errorf("Failed to write packet: %v", err)
+		return err
+	}
+
+	return nil
+}
+
 func (c *TUICClient) isConnAlive() bool {
 	select {
 	case <-c.conn.Context().Done():
@@ -204,249 +326,4 @@ func (c *TUICClient) isConnAlive() bool {
 	default:
 		return true
 	}
-}
-
-func (c *TUICClient) OnHandleUdpConnect(udp *net.UDPConn, assocID uint16, data []byte, remoteAddr address.Address) {
-	if c.udp == nil {
-		c.udp = udp
-	}
-
-	opts := &options.PacketOptions{
-		AssocID:   assocID,
-		FragTotal: 1,
-		FragID:    0,
-		Size:      0,
-		Addr:      remoteAddr,
-	}
-
-	opts.CalFragTotal(data, 2048)
-	switch {
-	case opts.FragTotal > 1:
-		c.onRelayFragmentedUdpSend(data, opts)
-	default:
-		c.onRelayUdpSend(data, opts)
-	}
-}
-
-func (c *TUICClient) OnHandleTcpConnect(conn *net.TCPConn, remoteAddr address.Address) error {
-	opts := &options.ConnectOptions{
-		Addr: remoteAddr,
-	}
-
-	ctx, cancel := context.WithDeadline(c.ctx, time.Now().Add(time.Second*3))
-	defer cancel()
-
-	stream, err := c.conn.OpenStreamSync(ctx)
-	if err != nil {
-		logrus.Errorf("open stream failed: %v", err)
-		return err
-	}
-
-	_ = stream.SetDeadline(time.Now().Add(time.Second * 10))
-
-	defer c.onCloseStream(stream)
-
-	cmd := protocol.Command{
-		Version: protocol.VersionMajor,
-		Type:    protocol.CmdConnect,
-		Options: opts,
-	}
-
-	err = c.onSendCommand(stream, cmd)
-	if err != nil {
-		logrus.Errorf("send command failed: %v", err)
-		return err
-	}
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		// 从conn读取数据并写入stream
-		_, err := io.Copy(stream, conn)
-		if err != nil {
-			// 取消写入并通知服务器
-			switch {
-			case errors.Is(err, net.ErrClosed):
-				stream.CancelWrite(protocol.NormalClosed)
-			default:
-				stream.CancelWrite(protocol.ClientCanceled)
-
-				var e *quic.StreamError
-				if errors.As(err, &e) && e.ErrorCode == protocol.NormalClosed {
-					return
-				}
-
-				logrus.Errorf("stream, packet.TcpConn err: %v", err)
-
-			}
-
-			return
-		}
-
-		// 数据发送完毕，正常关闭写入端
-		_ = stream.Close()
-	}()
-
-	go func() {
-		defer wg.Done()
-		// 从stream读取数据并写入conn
-		_, err := io.Copy(conn, stream)
-		if err != nil {
-			_ = conn.Close()
-
-			var e *quic.StreamError
-			if errors.As(err, &e) && e.ErrorCode == protocol.NormalClosed {
-				return
-			}
-
-			switch {
-			case errors.Is(err, net.ErrClosed):
-				return
-			case strings.Contains(err.Error(), "deadline exceeded"):
-				return
-			default:
-				logrus.Errorf("conn, stream err: %v", err)
-			}
-
-		}
-	}()
-
-	wg.Wait()
-
-	return nil
-}
-
-func (c *TUICClient) onHandlePacket(stream io.Reader) error {
-	// 反序列化options,处理UDP数据包,必要时建立新的UDP会话
-	optBytes := make([]byte, protocol.PacketLen)
-	_, err := io.ReadFull(stream, optBytes)
-	if err != nil {
-		logrus.Errorf("onHandlePacket io.ReadFull err:%v", err)
-		return err
-	}
-
-	if len(optBytes) < protocol.PacketLen {
-		return errors.New("invalid packet")
-	}
-
-	var opts options.PacketOptions
-	err = opts.Unmarshal(optBytes)
-	if err != nil {
-		logrus.Errorf("options.PacketOptions.Unmarshal err:%v", err)
-		return err
-	}
-
-	protocolAddr, err := address.UnMarshalAddr(stream)
-	if err != nil {
-		logrus.Errorf("address.UnMarshalAddr err:%v", err)
-		return err
-	}
-
-	opts.Addr = protocolAddr
-
-	// 计算实际数据长度
-	data := make([]byte, opts.Size)
-	_, err = io.ReadFull(stream, data)
-	if err != nil {
-		logrus.Errorf("onHandlePacket read real data err:%v", err)
-		return err
-	}
-
-	addr, err := opts.Addr.ResolveDNS()
-	if err != nil {
-		logrus.Errorf("[relay] [packet] [%06x] [%06x] failed to resolve dns: %v", opts.AssocID, opts.PacketID, err)
-		return err
-	}
-
-	if len(addr) == 0 {
-		logrus.Errorf("resolve dns empty addr")
-		return errors.New("resolve dns empty addr")
-	}
-
-	return nil
-}
-
-func (c *TUICClient) onCloseStream(stream quic.Stream) {
-	stream.CancelWrite(quic.StreamErrorCode(0))
-	stream.CancelRead(quic.StreamErrorCode(0))
-}
-
-func (c *TUICClient) onSendCommand(stream quic.SendStream, cmd protocol.Command) error {
-	// 发送Command
-	b, err := cmd.Marshal()
-	if err != nil {
-		return err
-	}
-
-	// 发送Command数据
-	_, err = stream.Write(b)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (c *TUICClient) onRelayFragmentedUdpSend(data []byte, opts *options.PacketOptions) {
-	fragSize := len(data) / int(opts.FragTotal)
-	for i := 0; i < int(opts.FragTotal); i++ {
-		opts.FragID = uint8(i)
-		start := i * fragSize
-		end := start + fragSize
-		if i == int(opts.FragTotal)-1 {
-			end = len(data)
-		}
-		fragment := data[start:end]
-		c.onRelayUdpSend(fragment, opts)
-	}
-}
-
-func (c *TUICClient) onRelayUdpSend(fragment []byte, opts *options.PacketOptions) {
-	opts.Size = uint16(len(fragment))
-	cmd := protocol.Command{
-		Version: protocol.VersionMajor,
-		Type:    protocol.CmdPacket,
-		Options: opts,
-	}
-
-	cmdBytes, err := cmd.Marshal()
-	if err != nil {
-		logrus.Errorf("marshal packet failed: %v", err)
-		return
-	}
-
-	cmdBytes = append(cmdBytes, fragment...)
-
-	switch c.UDPRelayMode {
-	case protocol.UdpRelayModeQuic:
-		err = c.sendFragments(cmdBytes)
-	case protocol.UdpRelayModeNative:
-		err = c.conn.SendDatagram(cmdBytes)
-	default:
-		logrus.Errorf("UDP relay mode %s not supported", c.UDPRelayMode)
-		return
-	}
-
-	if err != nil {
-		logrus.Errorf("send data failed: %v", err)
-	}
-}
-
-func (c *TUICClient) sendFragments(data []byte) error {
-	stream, err := c.conn.OpenUniStream()
-	if err != nil {
-		return fmt.Errorf("open stream failed: %v", err)
-	}
-
-	defer func() {
-		_ = stream.Close()
-	}()
-
-	_, err = stream.Write(data)
-	if err != nil {
-		return fmt.Errorf("write data failed: %v", err)
-	}
-
-	return nil
 }
