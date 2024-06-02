@@ -17,7 +17,8 @@
     ],
     "cert_path": "",
     "udp_relay_mode": "",
-    "max_stream_count": 100
+    "max_stream_count": 100,
+    "max_packet_size": 2048
   },
   "socks_config": {
     "server": "127.0.0.1:7798",
@@ -38,10 +39,11 @@ client_config:
 6. cert_path: 证书路径
 7. udp_relay_mode（暂未实现）: udp转发模式，可填入native或quic
 8. max_stream_count: 最大流个数
+9. max_packet_size: 分片包大小
 
 socks_config:
 1. server: socks5服务器地址
 2. ip: socks5服务器ip
 3. username: socks5用户名
 4. password: socks5密码
-5. max_packet_size: 最大包大小
+5. max_packet_size: 分片包大小

@@ -9,7 +9,8 @@
     ],
     "cert_path": "",
     "udp_relay_mode": "quic",
-    "max_stream_count": 32
+    "max_stream_count": 32,
+    "max_packet_size": 2048
   },
   "socks_config": {
     "server": "127.0.0.1:7798",

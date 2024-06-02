@@ -27,7 +27,7 @@ func (c *TUICClient) OnHandleUdpConnect(udp *net.UDPConn, assocID uint16, data [
 		Addr:      remoteAddr,
 	}
 
-	opts.CalFragTotal(data, 2048)
+	opts.CalFragTotal(data, c.MaxPacketSize)
 	switch {
 	case opts.FragTotal > 1:
 		c.onRelayFragmentedUdpSend(data, opts)
@@ -37,12 +37,15 @@ func (c *TUICClient) OnHandleUdpConnect(udp *net.UDPConn, assocID uint16, data [
 }
 
 func (c *TUICClient) onRelayFragmentedUdpSend(data []byte, opts *options.PacketOptions) {
-	fragSize := len(data) / int(opts.FragTotal)
+	// 确保即使 len(data) 不能被 opts.FragTotal 整除也能正确处理
+	fragSize := (len(data) + int(opts.FragTotal) - 1) / int(opts.FragTotal)
+	opts.Size = uint16(fragSize)
+
 	for i := 0; i < int(opts.FragTotal); i++ {
 		opts.FragID = uint8(i)
 		start := i * fragSize
 		end := start + fragSize
-		if i == int(opts.FragTotal)-1 {
+		if end > len(data) {
 			end = len(data)
 		}
 		c.onRelayUdpSend(data[start:end], opts)

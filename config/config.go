@@ -28,6 +28,7 @@ type ClientConfig struct {
 	ALPN             []string `json:"alpn"`
 	ZeroRTTHandshake bool     `json:"zero_rtt_handshake"`
 	MaxStreamCount   int64    `json:"max_stream_count"`
+	MaxPacketSize    uint32   `json:"max_packet_size"`
 }
 
 func (c *Config) Unmarshal(b []byte) error {
