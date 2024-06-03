@@ -39,6 +39,11 @@ func main() {
 		}
 
 		clientCfg = cfg.ClientConfig
+		err = cfg.ClientConfig.CheckValid()
+		if err != nil {
+			panic(err)
+		}
+
 		socksConfig = cfg.SocksConfig
 	} else {
 		clientCfg.SetDefaults()

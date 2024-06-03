@@ -43,6 +43,7 @@ func (c *ClientConfig) SetDefaults() {
 	c.UDPRelayMode = protocol.UdpRelayModeQuic
 	c.CertPath = ""
 	c.ZeroRTTHandshake = false
+	c.MaxPacketSize = 2048
 }
 
 func (c *ClientConfig) CheckValid() error {
@@ -50,8 +51,20 @@ func (c *ClientConfig) CheckValid() error {
 		return errors.New("uuid too short, must be at least 16 bytes")
 	}
 
+	if c.Server == "" {
+		return errors.New("server cannot be empty")
+	}
+
+	if c.UUID == "" {
+		return errors.New("uuid cannot be empty")
+	}
+
 	if c.Password == "" {
 		return errors.New("password cannot be empty")
+	}
+
+	if c.MaxPacketSize <= 0 {
+		c.MaxPacketSize = 2048
 	}
 
 	return nil
