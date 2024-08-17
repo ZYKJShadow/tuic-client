@@ -144,14 +144,6 @@ func (c *TUICClient) heartbeat() {
 			Type:    protocol.CmdHeartbeat,
 		}
 
-		if !c.isConnAlive() {
-			err := c.dial()
-			if err != nil {
-				logrus.Errorf("dial addr:%s failed: %v", c.Server, err)
-				continue
-			}
-		}
-
 		b, err := cmd.Marshal()
 		if err != nil {
 			logrus.Errorf("marshal heartbeat command failed: %v", err)
@@ -302,9 +294,6 @@ func (c *TUICClient) onHandleQUICPacket(data []byte, opts *options.PacketOptions
 }
 
 func (c *TUICClient) onHandlePacket(data []byte, opts *options.PacketOptions) error {
-	c.Lock()
-	defer c.Unlock()
-
 	conn := c.socketCacheMap[opts.AssocID]
 	if conn == nil {
 		return fmt.Errorf("conn not found, assocID: %d", opts.AssocID)
