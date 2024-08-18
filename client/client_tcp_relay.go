@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"errors"
 	"github.com/ZYKJShadow/tuic-protocol-go/address"
 	"github.com/ZYKJShadow/tuic-protocol-go/options"
@@ -9,28 +10,32 @@ import (
 	"github.com/sirupsen/logrus"
 	"io"
 	"net"
-	"sync"
 	"time"
 )
 
 func (c *TUICClient) OnHandleTcpConnect(conn *net.TCPConn, remoteAddr address.Address) error {
+	defer func() {
+		_ = conn.Close()
+	}()
+
 	opts := &options.ConnectOptions{
 		Addr: remoteAddr,
 	}
 
-	stream, err := c.conn.OpenStream()
+	ctx, cancel := context.WithDeadline(c.ctx, time.Now().Add(time.Second*5))
+	defer cancel()
+
+	stream, err := c.conn.OpenStreamSync(ctx)
 	if err != nil {
 		logrus.Errorf("open stream failed: %v", err)
 		return err
 	}
 
 	defer func() {
-		_ = conn.Close()
 		_ = stream.Close()
+		stream.CancelRead(protocol.NormalClosed)
+		stream.CancelWrite(protocol.NormalClosed)
 	}()
-
-	_ = stream.SetDeadline(time.Now().Add(time.Second * 5))
-	_ = conn.SetDeadline(time.Now().Add(time.Second * 5))
 
 	cmd := protocol.Command{
 		Version: protocol.VersionMajor,
@@ -44,20 +49,15 @@ func (c *TUICClient) OnHandleTcpConnect(conn *net.TCPConn, remoteAddr address.Ad
 		return err
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-
 	go func() {
-		defer wg.Done()
-		c.relay(conn, stream)
+		_ = c.relay(stream, conn)
 	}()
 
-	go func() {
-		defer wg.Done()
-		c.relay(stream, conn)
-	}()
-
-	wg.Wait()
+	// stream流无法读取的时候，表示服务端已经关闭连接，直接退出
+	err = c.relay(conn, stream)
+	if err != nil {
+		logrus.Errorf("conn, stream error: %v", err)
+	}
 
 	return nil
 }
@@ -78,59 +78,29 @@ func (c *TUICClient) onSendCommand(stream quic.SendStream, cmd protocol.Command)
 	return nil
 }
 
-func (c *TUICClient) relay(dst io.Writer, src io.Reader) {
-	var wg sync.WaitGroup
-	buf := make(chan []byte, 32*1024)
+func (c *TUICClient) relay(dst io.Writer, src io.Reader) error {
+	buf := make([]byte, 32*1024)
 
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		defer close(buf)
-
-		var e *quic.StreamError
-
-		for {
-			b := make([]byte, 32*1024)
-			n, err := src.Read(b)
-			if err != nil && err != io.EOF {
-				if errors.As(err, &e) && e.ErrorCode == protocol.NormalClosed {
-					return
-				}
-
-				logrus.Errorf("Read err: %v", err)
-				return
-			}
-
+	for {
+		n, err := src.Read(buf)
+		if err != nil {
 			if err == io.EOF {
-				return
+				return nil
 			}
 
-			if n <= 0 {
-				return
+			var e *quic.StreamError
+			if errors.As(err, &e) && e.ErrorCode == protocol.NormalClosed {
+				return nil
 			}
 
-			buf <- b[:n]
+			return err
 		}
-	}()
 
-	go func() {
-		defer wg.Done()
-		for {
-			select {
-			case b, ok := <-buf:
-				_, err := dst.Write(b)
-				if err != nil {
-					logrus.Errorf("Failed to write buf to stream: %v", err)
-					return
-				}
-
-				if !ok {
-					return
-				}
+		if n > 0 {
+			n, err = dst.Write(buf[:n])
+			if err != nil {
+				return err
 			}
 		}
-	}()
-
-	wg.Wait()
+	}
 }
