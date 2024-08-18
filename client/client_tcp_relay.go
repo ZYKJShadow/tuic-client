@@ -1,7 +1,7 @@
 package client
 
 import (
-	"context"
+	"errors"
 	"github.com/ZYKJShadow/tuic-protocol-go/address"
 	"github.com/ZYKJShadow/tuic-protocol-go/options"
 	"github.com/ZYKJShadow/tuic-protocol-go/protocol"
@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 )
 
 func (c *TUICClient) OnHandleTcpConnect(conn *net.TCPConn, remoteAddr address.Address) error {
@@ -17,23 +18,19 @@ func (c *TUICClient) OnHandleTcpConnect(conn *net.TCPConn, remoteAddr address.Ad
 		Addr: remoteAddr,
 	}
 
-	stream, err := c.conn.OpenStreamSync(context.Background())
+	stream, err := c.conn.OpenStream()
 	if err != nil {
 		logrus.Errorf("open stream failed: %v", err)
 		return err
 	}
 
 	defer func() {
-		err = stream.Close()
-		if err != nil {
-			logrus.Errorf("close stream failed: %v", err)
-		}
-
-		err = conn.Close()
-		if err != nil {
-			logrus.Errorf("close conn failed: %v", err)
-		}
+		_ = conn.Close()
+		_ = stream.Close()
 	}()
+
+	_ = stream.SetDeadline(time.Now().Add(time.Second * 5))
+	_ = conn.SetDeadline(time.Now().Add(time.Second * 5))
 
 	cmd := protocol.Command{
 		Version: protocol.VersionMajor,
@@ -57,7 +54,7 @@ func (c *TUICClient) OnHandleTcpConnect(conn *net.TCPConn, remoteAddr address.Ad
 
 	go func() {
 		defer wg.Done()
-		go c.relay(stream, conn)
+		c.relay(stream, conn)
 	}()
 
 	wg.Wait()
@@ -90,10 +87,17 @@ func (c *TUICClient) relay(dst io.Writer, src io.Reader) {
 	go func() {
 		defer wg.Done()
 		defer close(buf)
+
+		var e *quic.StreamError
+
 		for {
 			b := make([]byte, 32*1024)
 			n, err := src.Read(b)
 			if err != nil && err != io.EOF {
+				if errors.As(err, &e) && e.ErrorCode == protocol.NormalClosed {
+					return
+				}
+
 				logrus.Errorf("Read err: %v", err)
 				return
 			}
@@ -113,15 +117,17 @@ func (c *TUICClient) relay(dst io.Writer, src io.Reader) {
 	go func() {
 		defer wg.Done()
 		for {
-			b, ok := <-buf
-			_, err := dst.Write(b)
-			if err != nil {
-				logrus.Errorf("Write err: %v", err)
-				return
-			}
+			select {
+			case b, ok := <-buf:
+				_, err := dst.Write(b)
+				if err != nil {
+					logrus.Errorf("Failed to write buf to stream: %v", err)
+					return
+				}
 
-			if !ok {
-				return
+				if !ok {
+					return
+				}
 			}
 		}
 	}()

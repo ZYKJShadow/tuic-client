@@ -25,6 +25,7 @@ type TUICClient struct {
 	conn           quic.Connection
 	fragmentCache  *fragment.FCache
 	socketCacheMap map[uint16]*net.UDPConn
+	stream         quic.Stream
 
 	*config.ClientConfig
 	sync.RWMutex
@@ -144,6 +145,14 @@ func (c *TUICClient) heartbeat() {
 			Type:    protocol.CmdHeartbeat,
 		}
 
+		if !c.isConnAlive() {
+			err := c.dial()
+			if err != nil {
+				logrus.Errorf("dial addr:%s failed: %v", c.Server, err)
+				continue
+			}
+		}
+
 		b, err := cmd.Marshal()
 		if err != nil {
 			logrus.Errorf("marshal heartbeat command failed: %v", err)
@@ -216,6 +225,7 @@ func (c *TUICClient) onReceiveUniStream() {
 		stream, err := c.conn.AcceptUniStream(context.Background())
 		if err != nil {
 			logrus.Errorf("Failed to accept uni stream: %v", err)
+			time.Sleep(time.Second * 3)
 			continue
 		}
 
@@ -228,6 +238,7 @@ func (c *TUICClient) onReceiveDatagram() {
 		datagram, err := c.conn.ReceiveDatagram(context.Background())
 		if err != nil {
 			logrus.Errorf("Failed to receive datagram: %v", err)
+			time.Sleep(time.Second * 3)
 			continue
 		}
 
